@@ -1,0 +1,1326 @@
+"""
+Project Health Reporting Agent — Main Application
+==================================================
+AI-powered agent that analyzes project plans, evaluates health using
+a RAG (Red-Amber-Green) framework, and generates executive-ready reports.
+
+This file defines the Streamlit application skeleton.
+Business logic will be added in subsequent implementation steps.
+"""
+
+import json
+import os
+import sys
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_api_key = os.getenv("OPENAI_API_KEY")
+if _api_key:
+    print("✓ .env Loaded")
+    _masked_key = f"{_api_key[:8]}******" if len(_api_key) >= 8 else "******"
+    print(f"✓ API Key Loaded: {_masked_key}")
+    try:
+        from services.llm_client import create_llm_client
+        _client = create_llm_client()
+        if _client.is_available():
+            print("✓ OpenAI Client Initialized")
+    except Exception:
+        pass
+
+import streamlit as st
+
+from pathlib import Path
+from services.file_upload import (
+    clear_uploads,
+    get_invalid_uploads,
+    get_valid_uploads,
+    has_uploads,
+    process_uploads,
+)
+from services.excel_reader import read_workbook, read_sheet_dataframe
+from services.data_preview import generate_data_preview
+from services.schema_detector import detect_schema
+from services.data_normalizer import normalize_dataframe
+import importlib
+if "models.report_models" in sys.modules and not hasattr(sys.modules["models.report_models"], "Project"):
+    importlib.reload(sys.modules["models.report_models"])
+if "services.comment_extractor" in sys.modules:
+    importlib.reload(sys.modules["services.comment_extractor"])
+
+from services.comment_extractor import extract_comments
+from models.report_models import Project, ProjectInfo
+from models.health_models import ProjectHealthScorecard
+from models.decision_models import RAGDecisionResult
+from models.rca_models import RootCauseAnalysisResult
+from models.recommendation_models import RecommendationResult
+from models.portfolio_models import PortfolioAnalyticsResult
+from services.health_indicators.engine import HealthIndicatorEngine
+from agents.stakeholder_sentiment import StakeholderSentimentAgent
+from agents.rag_decision import RAGDecisionAgent
+from agents.root_cause_analysis import RootCauseAnalysisAgent
+from agents.recommendation import RecommendationAgent
+from services.report_generator import WeeklyReportGenerator
+from agents.portfolio_analytics import PortfolioAnalyticsEngine
+from services.presentation.pptx_generator import ExecutivePowerPointGenerator
+
+# =============================================================================
+# Page Configuration
+# Must be the first Streamlit command in the script.
+# =============================================================================
+st.set_page_config(
+    page_title="Project Health Agent",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# =============================================================================
+# Custom Styling
+# Provides a clean, professional look across the application.
+# =============================================================================
+def apply_custom_styles():
+    """Inject custom CSS for a polished, production-ready appearance."""
+    st.markdown(
+        """
+        <style>
+        /* --- Global --- */
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+
+        /* --- Header banner --- */
+        .app-header {
+            background: linear-gradient(135deg, #1e3a5f 0%, #2d6a9f 100%);
+            padding: 1.8rem 2rem;
+            border-radius: 12px;
+            margin-bottom: 1.5rem;
+            color: #ffffff;
+        }
+        .app-header h1 {
+            margin: 0;
+            font-size: 1.9rem;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+        }
+        .app-header p {
+            margin: 0.4rem 0 0 0;
+            font-size: 1rem;
+            opacity: 0.88;
+        }
+
+        /* --- Section cards --- */
+        .section-card {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 1.6rem 1.8rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+        }
+        .section-card h3 {
+            margin-top: 0;
+            color: #1e3a5f;
+            font-size: 1.15rem;
+        }
+        .section-card p {
+            color: #64748b;
+            font-size: 0.92rem;
+        }
+
+        /* --- Sidebar polish --- */
+        [data-testid="stSidebar"] {
+            background: #f8fafc;
+        }
+        .sidebar-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            margin: 1.2rem 0 0.5rem 0;
+        }
+
+        /* --- Status badges --- */
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 0.78rem;
+            font-weight: 600;
+        }
+        .badge-pending  { background: #fef3c7; color: #92400e; }
+        .badge-ready    { background: #d1fae5; color: #065f46; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =============================================================================
+# Sidebar
+# Navigation and module status indicators for the application.
+# =============================================================================
+def render_sidebar():
+    """Render the sidebar with navigation and module status placeholders."""
+    with st.sidebar:
+        # Branding
+        st.markdown("## 📊 Health Agent")
+        st.caption("AI-Powered Project Reporting")
+        st.divider()
+
+        # ---- Navigation ----
+        st.markdown('<p class="sidebar-title">Navigation</p>', unsafe_allow_html=True)
+        page = st.radio(
+            label="Navigate",
+            options=[
+                "🏠  Dashboard",
+                "📁  Upload & Analyze",
+                "📈  Portfolio View",
+                "📄  Reports",
+            ],
+            label_visibility="collapsed",
+        )
+
+        st.divider()
+
+        # ---- Module Status ----
+        # Shows implementation readiness of each module.
+        # Badges will flip to "Ready" as modules are built.
+        st.markdown('<p class="sidebar-title">Module Status</p>', unsafe_allow_html=True)
+
+        is_analyzed = "analyzed_projects" in st.session_state and bool(st.session_state["analyzed_projects"])
+        has_portfolio = "portfolio_analytics" in st.session_state and bool(st.session_state["portfolio_analytics"])
+
+        modules = {
+            "File Upload":        "Ready",
+            "Excel Reader":       "Ready",
+            "Data Validator":     "Ready",
+            "Health Indicators":  "Ready" if is_analyzed else "Pending",
+            "AI Reasoning":       "Ready" if is_analyzed else "Pending",
+            "RAG Engine":         "Ready" if is_analyzed else "Pending",
+            "Recommendations":    "Ready" if is_analyzed else "Pending",
+            "Report Generator":   "Ready" if is_analyzed else "Pending",
+            "Portfolio Analyzer": "Ready" if has_portfolio else "Pending",
+            "PPT Generator":      "Ready" if has_portfolio else "Pending",
+        }
+
+        for module_name, status in modules.items():
+            badge_class = "badge-ready" if status == "Ready" else "badge-pending"
+            st.markdown(
+                f'{module_name} &nbsp; '
+                f'<span class="status-badge {badge_class}">{status}</span>',
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+
+        # ---- App Info ----
+        st.markdown('<p class="sidebar-title">About</p>', unsafe_allow_html=True)
+        st.caption("Version 0.1.0")
+        st.caption("Python 3.13 · Streamlit · OpenAI")
+
+    return page
+
+
+# =============================================================================
+# Header
+# =============================================================================
+def render_header():
+    """Display the branded application header."""
+    st.markdown(
+        """
+        <div class="app-header">
+            <h1>📊 Project Health Reporting Agent</h1>
+            <p>
+                Upload project plans · Evaluate health (RAG) ·
+                AI-powered insights · Executive-ready reports
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =============================================================================
+# Page: Dashboard
+# Default landing page showing overview cards.
+# =============================================================================
+def render_dashboard():
+    """Render the dashboard page with summary metric cards."""
+    # KPI row
+    if "portfolio_analytics" in st.session_state and st.session_state["portfolio_analytics"]:
+        pa = st.session_state["portfolio_analytics"]
+        dist = pa.portfolio_health_distribution
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(label="Projects Analyzed", value=f"{dist.total_projects}")
+        col2.metric(label="🟢 Green", value=f"{dist.green_count} ({dist.green_percent}%)")
+        col3.metric(label="🟡 Amber", value=f"{dist.amber_count} ({dist.amber_percent}%)")
+        col4.metric(label="🔴 Red", value=f"{dist.red_count} ({dist.red_percent}%)")
+    elif "analyzed_projects" in st.session_state and st.session_state["analyzed_projects"]:
+        projs = st.session_state["analyzed_projects"]
+        total = len(projs)
+        g = sum(1 for p in projs.values() if p["decision"].overall_rag.value.lower() == "green")
+        a = sum(1 for p in projs.values() if p["decision"].overall_rag.value.lower() == "amber")
+        r = sum(1 for p in projs.values() if p["decision"].overall_rag.value.lower() == "red")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(label="Projects Analyzed", value=f"{total}")
+        col2.metric(label="🟢 Green", value=f"{g}")
+        col3.metric(label="🟡 Amber", value=f"{a}")
+        col4.metric(label="🔴 Red", value=f"{r}")
+    else:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(label="Projects Analyzed", value="—")
+        col2.metric(label="🟢 Green", value="—")
+        col3.metric(label="🟡 Amber", value="—")
+        col4.metric(label="🔴 Red", value="—")
+
+    st.markdown("---")
+
+    # Informational cards
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown(
+            """
+            <div class="section-card">
+                <h3>🚀 Getting Started</h3>
+                <p>
+                    Upload one or more project plan spreadsheets (.xlsx) to begin
+                    automated health analysis. The agent will extract tasks,
+                    milestones, risks, and comments to determine each project's
+                    RAG status.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        st.markdown(
+            """
+            <div class="section-card">
+                <h3>📋 What You Get</h3>
+                <p>
+                    • Overall RAG status with AI reasoning<br>
+                    • Identified risks and blockers<br>
+                    • Actionable recommendations<br>
+                    • Weekly health reports<br>
+                    • Executive PowerPoint presentations
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# =============================================================================
+# Page: Upload & Analyze
+# File upload interface with validation, metadata display, and analysis stub.
+# =============================================================================
+def render_upload_page():
+    """Render the file upload page with validation and metadata display."""
+    st.subheader("📁 Upload Project Plans")
+    st.info(
+        "Upload one or more Excel files (.xlsx) containing your project plans. "
+        "The agent will validate, extract, and analyze project health automatically.",
+        icon="ℹ️",
+    )
+
+    # ---- File Uploader ----
+    uploaded_files = st.file_uploader(
+        "Choose Excel files",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        help="Supported format: Microsoft Excel (.xlsx). Max 50 MB per file.",
+    )
+
+    # ---- Process Uploads ----
+    if uploaded_files:
+        # Validate and store metadata via the upload service
+        results = process_uploads(uploaded_files)
+
+        valid = get_valid_uploads()
+        invalid = get_invalid_uploads()
+
+        # ---- Success summary ----
+        if valid:
+            st.success(
+                f"{len(valid)} file(s) uploaded and validated successfully.",
+                icon="✅",
+            )
+
+        # ---- Validation errors ----
+        if invalid:
+            for f_info in invalid:
+                st.error(f"❌ **{f_info.filename}** — {f_info.error}", icon="🚫")
+
+        # ---- Uploaded files table ----
+        st.markdown("#### 📋 Uploaded Files")
+
+        # Build table rows
+        table_header = (
+            "| # | Filename | Size | Uploaded At | Status |\n"
+            "|---|----------|------|-------------|--------|\n"
+        )
+        table_rows = ""
+        for idx, f_info in enumerate(results, start=1):
+            status_icon = "✅" if f_info.status == "Uploaded" else "❌"
+            table_rows += (
+                f"| {idx} "
+                f"| 📄 {f_info.filename} "
+                f"| {f_info.size_display} "
+                f"| {f_info.uploaded_at_display} "
+                f"| {status_icon} {f_info.status} |\n"
+            )
+
+        st.markdown(table_header + table_rows)
+
+        # ---- Action buttons ----
+        col_analyze, col_clear = st.columns([3, 1])
+
+        with col_analyze:
+            analyze_disabled = not has_uploads()
+            if st.button(
+                "🔍 Analyze Projects",
+                type="primary",
+                use_container_width=True,
+                disabled=analyze_disabled,
+            ):
+                with st.spinner("Executing end-to-end AI project health pipeline..."):
+                    valid_infos = get_valid_uploads()
+                    valid_files = [f for f in uploaded_files if any(info.filename == f.name for info in valid_infos)]
+                    analyzed_projects = {}
+                    weekly_reports = []
+
+                    engine = HealthIndicatorEngine()
+                    sentiment_agent = StakeholderSentimentAgent()
+                    rag_agent = RAGDecisionAgent()
+                    rca_agent = RootCauseAnalysisAgent()
+                    rec_agent = RecommendationAgent()
+                    report_generator = WeeklyReportGenerator()
+
+                    for file in valid_files:
+                        wb_info = read_workbook(file)
+                        sheet_list = wb_info.sheet_names if wb_info else []
+                        if not sheet_list:
+                            continue
+                        
+                        sheet_name = next((s for s in sheet_list if not wb_info.get_worksheet(s).is_empty), sheet_list[0])
+                        sheet_df = read_sheet_dataframe(file, sheet_name)
+                        schema = detect_schema(sheet_df, sheet_name)
+                        norm_result = normalize_dataframe(sheet_df, schema)
+                        cmt_result = extract_comments(file, sheet_list, normalized_df=norm_result.normalized_df)
+                        st.session_state[f"comments_{file.name}"] = cmt_result
+                        comments_input = cmt_result.to_ai_input() if cmt_result.has_comments else []
+
+                        p_info = ProjectInfo(project_name=file.name, comments=comments_input)
+                        project_obj = Project(project_name=file.name, comments=comments_input)
+                        st.session_state["project_objects"] = st.session_state.get("project_objects", {})
+                        st.session_state["project_objects"][file.name] = project_obj
+
+                        st.session_state["uploaded_workbooks"] = st.session_state.get("uploaded_workbooks", {})
+                        st.session_state["uploaded_workbooks"][file.name] = wb_info
+                        st.session_state["projects"] = st.session_state.get("projects", {})
+                        st.session_state["projects"][file.name] = norm_result.normalized_df
+
+                        scorecard = engine.evaluate(norm_result.normalized_df, project_name=file.name, comments=comments_input)
+                        st.session_state["scorecards"] = st.session_state.get("scorecards", {})
+                        st.session_state["scorecards"][file.name] = scorecard
+
+                        sentiment = sentiment_agent.analyze(comments=comments_input, project_name=file.name)
+                        st.session_state["ai_analyses"] = st.session_state.get("ai_analyses", {})
+                        st.session_state["ai_analyses"][file.name] = sentiment
+
+                        decision = rag_agent.decide(scorecard, sentiment)
+                        st.session_state["rag_results"] = st.session_state.get("rag_results", {})
+                        st.session_state["rag_results"][file.name] = decision
+
+                        rca = rca_agent.analyze(scorecard, decision, comments=comments_input)
+
+                        recs = rec_agent.generate(scorecard, decision, rca, comments=comments_input)
+                        st.session_state["recommendations"] = st.session_state.get("recommendations", {})
+                        st.session_state["recommendations"][file.name] = recs
+
+                        weekly_report_obj = report_generator.build_report_data(p_info, scorecard, decision, rca, recs)
+                        weekly_report_md = report_generator.generate_report(p_info, scorecard, decision, rca, recs, format_type="markdown")
+                        weekly_reports.append(weekly_report_obj)
+
+                        st.session_state["weekly_reports"] = st.session_state.get("weekly_reports", {})
+                        st.session_state["weekly_reports"][file.name] = weekly_report_md
+
+                        analyzed_projects[file.name] = {
+                            "scorecard": scorecard,
+                            "sentiment": sentiment,
+                            "decision": decision,
+                            "rca": rca,
+                            "recommendations": recs,
+                            "weekly_report_obj": weekly_report_obj,
+                            "weekly_report_md": weekly_report_md,
+                            "project": project_obj,
+                            "project_info": p_info,
+                        }
+
+                    st.session_state["analyzed_projects"] = analyzed_projects
+
+                    if weekly_reports:
+                        portfolio_engine = PortfolioAnalyticsEngine()
+                        portfolio_result = portfolio_engine.analyze(weekly_reports)
+                        st.session_state["portfolio_analytics"] = portfolio_result
+
+                        pptx_gen = ExecutivePowerPointGenerator()
+                        pptx_result = pptx_gen.generate(portfolio_result)
+                        st.session_state["pptx_presentation"] = pptx_result
+                        st.session_state["pptx_path"] = pptx_result.file_path
+
+                st.success("✅ Analysis Complete! All modules executed successfully.")
+                st.rerun()
+
+        with col_clear:
+            if st.button(
+                "🗑️ Clear All",
+                use_container_width=True,
+            ):
+                clear_uploads()
+                st.rerun()
+
+    else:
+        # ---- Empty state ----
+        st.markdown(
+            """
+            <div class="section-card" style="text-align:center; padding:2.5rem;">
+                <h3 style="color:#94a3b8;">📂 No files uploaded yet</h3>
+                <p>Drag and drop Excel files above, or click <b>Browse files</b> to begin.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    # ================================================================
+    # Workbook Explorer
+    # Displays structural metadata for each uploaded workbook.
+    # ================================================================
+    if uploaded_files and has_uploads():
+        st.subheader("📖 Workbook Explorer")
+
+        # Let user pick which uploaded file to explore
+        valid_files = [f for f in uploaded_files if any(
+            info.filename == f.name and info.status == "Uploaded"
+            for info in results
+        )]
+
+        if not valid_files:
+            st.caption("No valid workbooks to explore.")
+        else:
+            file_names = [f.name for f in valid_files]
+            selected_file_name = st.selectbox(
+                "Select a workbook to explore",
+                options=file_names,
+                key="workbook_selector",
+            )
+
+            # Find the matching UploadedFile object
+            selected_file = next(
+                f for f in valid_files if f.name == selected_file_name
+            )
+
+            # Read workbook metadata (cached in session state per file)
+            cache_key = f"workbook_info_{selected_file_name}"
+            if cache_key not in st.session_state:
+                with st.spinner(f"Reading {selected_file_name}..."):
+                    st.session_state[cache_key] = read_workbook(selected_file)
+
+            wb_info = st.session_state[cache_key]
+
+            # ---- Workbook-level errors ----
+            if wb_info.has_errors:
+                for err in wb_info.errors:
+                    st.error(err, icon="⚠️")
+
+            # ---- Workbook summary metrics ----
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Workbook", wb_info.filename)
+            m2.metric("Worksheets", wb_info.sheet_count)
+            non_empty = len(wb_info.get_non_empty_sheets())
+            m3.metric("Non-Empty Sheets", non_empty)
+
+            st.markdown("---")
+
+            # ---- Worksheet-level details ----
+            if wb_info.sheet_names:
+                selected_sheet = st.selectbox(
+                    "Select a worksheet to inspect",
+                    options=wb_info.sheet_names,
+                    format_func=lambda s: wb_info.worksheets[s].summary,
+                    key="sheet_selector",
+                )
+
+                ws_info = wb_info.get_worksheet(selected_sheet)
+
+                if ws_info and not ws_info.is_empty:
+                    # ---- Sheet metrics ----
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Rows", f"{ws_info.num_rows:,}")
+                    c2.metric("Columns", ws_info.num_columns)
+                    c3.metric("Status", "Has Data" if not ws_info.is_empty else "Empty")
+
+                    # ---- Column names ----
+                    with st.expander(
+                        f"📋 Column Names ({ws_info.num_columns} columns)",
+                        expanded=True,
+                    ):
+                        # Display columns in a compact multi-column layout
+                        cols_per_row = 4
+                        for row_start in range(0, len(ws_info.column_names), cols_per_row):
+                            row_cols = st.columns(cols_per_row)
+                            for i, col_widget in enumerate(row_cols):
+                                idx = row_start + i
+                                if idx < len(ws_info.column_names):
+                                    col_widget.code(
+                                        ws_info.column_names[idx], language=None
+                                    )
+
+                    # ============================================
+                    # Data Preview Module (Task 3.5)
+                    # ============================================
+                    st.markdown("#### 🔬 Data Preview")
+
+                    # Load full DataFrame for profiling (cached)
+                    df_cache_key = f"sheet_df_{selected_file_name}_{selected_sheet}"
+                    if df_cache_key not in st.session_state:
+                        with st.spinner("Loading sheet data..."):
+                            st.session_state[df_cache_key] = read_sheet_dataframe(
+                                selected_file, selected_sheet
+                            )
+
+                    sheet_df = st.session_state[df_cache_key]
+
+                    if sheet_df.empty:
+                        st.warning("Could not read sheet data.", icon="⚠️")
+                    else:
+                        # Generate full preview result
+                        preview_cache_key = f"preview_{selected_file_name}_{selected_sheet}"
+                        if preview_cache_key not in st.session_state:
+                            st.session_state[preview_cache_key] = generate_data_preview(
+                                sheet_df, selected_sheet
+                            )
+
+                        preview = st.session_state[preview_cache_key]
+
+                        # ---- Tabbed Interface ----
+                        tab_rows, tab_types, tab_missing, tab_stats = st.tabs([
+                            "📄 First 10 Rows",
+                            "🧮 Data Types",
+                            "❓ Missing Values",
+                            "📊 Statistics",
+                        ])
+
+                        # Tab 1: First 10 Rows
+                        with tab_rows:
+                            st.dataframe(
+                                preview.preview_df,
+                                use_container_width=True,
+                                hide_index=False,
+                            )
+                            st.caption(
+                                f"Showing {len(preview.preview_df)} of "
+                                f"{preview.total_rows:,} rows"
+                            )
+
+                        # Tab 2: Data Types
+                        with tab_types:
+                            st.dataframe(
+                                preview.dtype_df,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.caption(
+                                f"{preview.total_columns} columns total"
+                            )
+
+                        # Tab 3: Missing Values
+                        with tab_missing:
+                            missing = preview.missing_df
+                            has_nulls = missing["Missing"].sum() > 0
+
+                            if has_nulls:
+                                # Highlight columns with missing data
+                                missing_only = missing[
+                                    missing["Missing"] > 0
+                                ].sort_values("Missing", ascending=False)
+
+                                st.warning(
+                                    f"{len(missing_only)} column(s) have missing values.",
+                                    icon="⚠️",
+                                )
+                                st.dataframe(
+                                    missing_only,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            else:
+                                st.success(
+                                    "No missing values found in this worksheet.",
+                                    icon="✅",
+                                )
+
+                            # Always show full table in expander
+                            with st.expander("View all columns"):
+                                st.dataframe(
+                                    missing,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                        # Tab 4: Statistics
+                        with tab_stats:
+                            if preview.stats_df is not None:
+                                st.dataframe(
+                                    preview.stats_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                                st.caption(
+                                    "Descriptive statistics for numeric columns "
+                                    "(count, mean, std, min, 25%, 50%, 75%, max)"
+                                )
+                            else:
+                                st.info(
+                                    "No numeric columns found in this worksheet. "
+                                    "Statistics are only generated for numeric data.",
+                                    icon="ℹ️",
+                                )
+
+                    # ============================================
+                    # Schema Detection (Task 4)
+                    # ============================================
+                    st.markdown("#### 🧩 Schema Detection")
+
+                    schema_cache_key = (
+                        f"schema_{selected_file_name}_{selected_sheet}"
+                    )
+                    if schema_cache_key not in st.session_state:
+                        st.session_state[schema_cache_key] = detect_schema(
+                            sheet_df, selected_sheet
+                        )
+
+                    schema = st.session_state[schema_cache_key]
+
+                    # ---- Coverage metric ----
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.metric(
+                        "Mapped Columns",
+                        f"{len(schema.mapped_columns)} / {schema.total_columns}",
+                    )
+                    sc2.metric("Coverage", f"{schema.coverage_percent}%")
+                    sc3.metric(
+                        "Categories Detected",
+                        len(schema.detected_categories),
+                    )
+
+                    # ---- Mapped columns table ----
+                    if schema.mapped_columns:
+                        with st.expander(
+                            f"✅ Mapped Columns ({len(schema.mapped_columns)})",
+                            expanded=True,
+                        ):
+                            table_hdr = (
+                                "| Raw Column | → | Standard Field "
+                                "| Category | Match | Confidence |\n"
+                                "|------------|---|----------------|-------"
+                                "---|-------|------------|\n"
+                            )
+                            table_rows = ""
+                            for m in schema.mapped_columns:
+                                conf_icon = (
+                                    "🟢" if m.confidence == "high" else "🟡"
+                                )
+                                table_rows += (
+                                    f"| `{m.raw_name}` "
+                                    f"| → "
+                                    f"| **{m.standard_name}** "
+                                    f"| {m.category} "
+                                    f"| {m.match_type} "
+                                    f"| {conf_icon} {m.confidence} |\n"
+                                )
+                            st.markdown(table_hdr + table_rows)
+
+                    # ---- Unmapped columns ----
+                    if schema.unmapped_columns:
+                        with st.expander(
+                            f"❓ Unmapped Columns ({len(schema.unmapped_columns)})",
+                            expanded=False,
+                        ):
+                            st.caption(
+                                "These columns were not matched to any "
+                                "standard field. They will be available "
+                                "as raw data during analysis."
+                            )
+                            cols_per_row = 4
+                            for row_start in range(
+                                0, len(schema.unmapped_columns), cols_per_row
+                            ):
+                                row_cols = st.columns(cols_per_row)
+                                for i, col_w in enumerate(row_cols):
+                                    idx = row_start + i
+                                    if idx < len(schema.unmapped_columns):
+                                        col_w.code(
+                                            schema.unmapped_columns[idx],
+                                            language=None,
+                                        )
+
+                    # ---- Detected categories ----
+                    if schema.detected_categories:
+                        with st.expander(
+                            f"🏷️ Detected Categories ({len(schema.detected_categories)})",
+                            expanded=False,
+                        ):
+                            st.write(
+                                " · ".join(
+                                    f"**{cat}**"
+                                    for cat in schema.detected_categories
+                                )
+                            )
+
+                    # ============================================
+                    # Data Normalization (Task 5)
+                    # ============================================
+                    st.markdown("#### 🔄 Data Normalization")
+
+                    norm_cache_key = (
+                        f"norm_{selected_file_name}_{selected_sheet}"
+                    )
+                    if norm_cache_key not in st.session_state:
+                        with st.spinner("Normalizing data..."):
+                            st.session_state[norm_cache_key] = (
+                                normalize_dataframe(sheet_df, schema)
+                            )
+
+                    norm_result = st.session_state[norm_cache_key]
+
+                    # ---- Normalization metrics ----
+                    nm1, nm2, nm3, nm4 = st.columns(4)
+                    nm1.metric(
+                        "Transformations",
+                        norm_result.total_transformations,
+                    )
+                    nm2.metric(
+                        "Date Columns",
+                        len(norm_result.date_columns),
+                    )
+                    nm3.metric(
+                        "Status Columns",
+                        len(norm_result.status_columns),
+                    )
+                    nm4.metric(
+                        "Progress Columns",
+                        len(norm_result.progress_columns),
+                    )
+
+                    # ---- Normalization log ----
+                    if norm_result.logs:
+                        with st.expander(
+                            f"📝 Normalization Log "
+                            f"({norm_result.total_transformations} actions)",
+                            expanded=True,
+                        ):
+                            log_header = (
+                                "| Column | Action | Before | After "
+                                "| Details |\n"
+                                "|--------|--------|--------|-------"
+                                "|---------|\n"
+                            )
+                            log_rows = ""
+                            for log in norm_result.logs:
+                                log_rows += (
+                                    f"| `{log.column}` "
+                                    f"| {log.action} "
+                                    f"| {log.original_values} "
+                                    f"| {log.normalized_values} "
+                                    f"| {log.details} |\n"
+                                )
+                            st.markdown(log_header + log_rows)
+
+                    # ---- Normalized data tabs ----
+                    n_tab_data, n_tab_status, n_tab_dates = st.tabs([
+                        "📄 Normalized Data",
+                        "🎨 Status Distribution",
+                        "📅 Date Columns",
+                    ])
+
+                    with n_tab_data:
+                        st.dataframe(
+                            norm_result.normalized_df.head(10),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        st.caption(
+                            f"Showing first 10 of "
+                            f"{len(norm_result.normalized_df):,} rows "
+                            f"({len(norm_result.normalized_df.columns)} columns)"
+                        )
+
+                    with n_tab_status:
+                        if norm_result.status_columns:
+                            for col in norm_result.status_columns:
+                                counts = (
+                                    norm_result.normalized_df[col]
+                                    .value_counts()
+                                    .reset_index()
+                                )
+                                counts.columns = ["Status", "Count"]
+                                st.dataframe(
+                                    counts,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                        else:
+                            st.info(
+                                "No status columns detected in this sheet.",
+                                icon="ℹ️",
+                            )
+
+                    with n_tab_dates:
+                        if norm_result.date_columns:
+                            for col in norm_result.date_columns:
+                                series = norm_result.normalized_df[col]
+                                valid = series.notna().sum()
+                                total = len(series)
+                                st.markdown(
+                                    f"**{col}** — "
+                                    f"{valid}/{total} valid dates"
+                                )
+                                if valid > 0:
+                                    min_d = series.min()
+                                    max_d = series.max()
+                                    st.caption(
+                                        f"Range: {min_d} → {max_d}"
+                                    )
+                        else:
+                            st.info(
+                                "No date columns detected in this sheet.",
+                                icon="ℹ️",
+                            )
+
+                    # ---- Column comparison (original vs normalized) ----
+                    if norm_result.renamed_columns:
+                        with st.expander(
+                            "🔀 Column Name Comparison",
+                            expanded=False,
+                        ):
+                            cmp_header = (
+                                "| # | Original Column | → "
+                                "| Normalized Column |\n"
+                                "|---|-----------------|---"
+                                "|-------------------|\n"
+                            )
+                            cmp_rows = ""
+                            for i, (raw, std) in enumerate(
+                                norm_result.renamed_columns.items(), 1
+                            ):
+                                cmp_rows += (
+                                    f"| {i} | `{raw}` | → "
+                                    f"| **{std}** |\n"
+                                )
+                            st.markdown(cmp_header + cmp_rows)
+
+                elif ws_info:
+                    st.warning(
+                        f"Worksheet **{selected_sheet}** is empty.", icon="📭"
+                    )
+            else:
+                st.warning("No worksheets found in this workbook.", icon="📭")
+
+    st.markdown("---")
+
+    # ================================================================
+    # Project Comments Section
+    # Extracts comments from the Comments worksheet (if present).
+    # ================================================================
+    if uploaded_files and has_uploads():
+        st.subheader("💬 Project Comments")
+
+        # Use the same workbook selector value
+        valid_files = [f for f in uploaded_files if any(
+            info.filename == f.name and info.status == "Uploaded"
+            for info in results
+        )]
+
+        if valid_files:
+            # Pick the currently selected workbook
+            sel_name = st.session_state.get("workbook_selector")
+            sel_file = next(
+                (f for f in valid_files if f.name == sel_name),
+                valid_files[0],
+            )
+
+            # Get sheet names from cached workbook info
+            wb_cache = st.session_state.get(
+                f"workbook_info_{sel_file.name}"
+            )
+            sheet_list = wb_cache.sheet_names if wb_cache else []
+
+            # Extract comments (cached)
+            cmt_cache_key = f"comments_{sel_file.name}"
+            if cmt_cache_key not in st.session_state:
+                norm_df = st.session_state.get("projects", {}).get(sel_file.name)
+                with st.spinner("Extracting comments..."):
+                    st.session_state[cmt_cache_key] = extract_comments(
+                        sel_file, sheet_list, normalized_df=norm_df
+                    )
+
+            cmt_result = st.session_state[cmt_cache_key]
+
+            # ---- Warnings ----
+            for w in cmt_result.warnings:
+                st.warning(w, icon="⚠️")
+
+            if cmt_result.has_comments:
+                # ---- Metrics ----
+                cm1, cm2, cm3, cm4 = st.columns(4)
+                cm1.metric("Source Sheet", cmt_result.source_sheet)
+                cm2.metric("Total Rows", cmt_result.total_rows)
+                cm3.metric("Valid Comments", cmt_result.valid_comments)
+                cm4.metric("Skipped Rows", cmt_result.skipped_rows)
+
+                # ---- Column mapping ----
+                if cmt_result.column_mapping:
+                    with st.expander(
+                        "🔗 Detected Column Mapping", expanded=False
+                    ):
+                        for std, raw in cmt_result.column_mapping.items():
+                            st.markdown(
+                                f"  `{raw}` → **{std}**"
+                            )
+
+                # ---- Comments table ----
+                comments_df = cmt_result.to_dataframe()
+
+                # Search filter
+                search = st.text_input(
+                    "🔍 Search comments",
+                    placeholder="Type to filter comments...",
+                    key="comment_search",
+                )
+
+                if search:
+                    mask = comments_df.apply(
+                        lambda row: row.astype(str).str.contains(
+                            search, case=False, na=False
+                        ).any(),
+                        axis=1,
+                    )
+                    filtered_df = comments_df[mask]
+                else:
+                    filtered_df = comments_df
+
+                st.dataframe(
+                    filtered_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "task_name": st.column_config.TextColumn(
+                            "Task", width="medium"
+                        ),
+                        "comment": st.column_config.TextColumn(
+                            "Comment", width="large"
+                        ),
+                        "owner": st.column_config.TextColumn(
+                            "Owner", width="small"
+                        ),
+                        "date": st.column_config.TextColumn(
+                            "Date", width="small"
+                        ),
+                    },
+                )
+                st.caption(
+                    f"Showing {len(filtered_df)} of "
+                    f"{cmt_result.valid_comments} comments"
+                )
+
+                # ---- AI-ready output preview ----
+                with st.expander(
+                    "🤖 AI-Ready Output Preview", expanded=False
+                ):
+                    ai_data = cmt_result.to_ai_input()
+                    # Show first 3 as sample
+                    st.code(
+                        json.dumps(ai_data[:3], indent=2, default=str),
+                        language="json",
+                    )
+                    st.caption(
+                        f"{len(ai_data)} comment(s) prepared for AI analysis"
+                    )
+
+            elif not cmt_result.warnings:
+                st.info(
+                    "No comments found in this workbook.",
+                    icon="ℹ️",
+                )
+
+    st.markdown("---")
+
+    # ---- Project Summary & AI Analysis Sections ----
+    st.subheader("📊 Project Summary")
+    if "analyzed_projects" in st.session_state and st.session_state["analyzed_projects"]:
+        proj_names = list(st.session_state["analyzed_projects"].keys())
+        sel_proj = st.selectbox("Select Project to View Analysis", options=proj_names, key="sel_proj_view")
+        
+        proj_data = st.session_state["analyzed_projects"][sel_proj]
+        scorecard: ProjectHealthScorecard = proj_data["scorecard"]
+        decision: RAGDecisionResult = proj_data["decision"]
+        rca: RootCauseAnalysisResult = proj_data["rca"]
+        recs: RecommendationResult = proj_data["recommendations"]
+        sentiment = proj_data["sentiment"]
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Overall RAG Status", decision.overall_rag.value if decision else scorecard.overall_status.value)
+        c2.metric("Overall Health Score", f"{round(scorecard.overall_score)} / 100")
+        c3.metric("Indicators Evaluated", len(scorecard.indicators))
+
+        st.markdown("#### 📈 Health Indicators Breakdown")
+        ind_rows = []
+        for cat, ind_res in scorecard.indicators.items():
+            ind_rows.append({
+                "Indicator Category": cat.value.title(),
+                "Status": ind_res.rag_status.value,
+                "Score": round(ind_res.score, 1) if ind_res.data_available else "N/A",
+                "Summary": ind_res.summary
+            })
+        st.dataframe(ind_rows, use_container_width=True, hide_index=True)
+    else:
+        st.markdown(
+            '<div class="section-card"><p>Project summary will appear here '
+            "after analysis is complete.</p></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.subheader("🤖 AI Analysis")
+    if "analyzed_projects" in st.session_state and st.session_state["analyzed_projects"]:
+        sel_proj = st.session_state.get("sel_proj_view", list(st.session_state["analyzed_projects"].keys())[0])
+        proj_data = st.session_state["analyzed_projects"][sel_proj]
+        decision = proj_data["decision"]
+        rca = proj_data["rca"]
+        sentiment = proj_data["sentiment"]
+        recs = proj_data["recommendations"]
+
+        t_rag, t_rca, t_sent, t_recs = st.tabs(["🎯 RAG Decision Reasoning", "🔍 Root Cause Analysis", "💬 Stakeholder Sentiment", "💡 Recommendations"])
+        with t_rag:
+            st.markdown(f"**Final RAG:** `{decision.overall_rag.value}` (Confidence: {decision.confidence_score}%)")
+            st.markdown(f"**Decision Summary:** {decision.decision_summary}")
+            st.markdown(f"**Business Impact:** {decision.business_impact}")
+            if decision.decision_trace:
+                with st.expander("Detailed Decision Trace"):
+                    for t in decision.decision_trace:
+                        st.markdown(f"- **[{t.influence.upper()}]** {t.indicator}: {t.reason}")
+        with t_rca:
+            st.markdown(f"**Executive Summary:** {rca.executive_summary}")
+            st.markdown(f"**Risk Escalation Level:** `{rca.risk_escalation}`")
+            if rca.root_causes:
+                st.markdown("**Identified Root Causes:**")
+                for rc in rca.root_causes:
+                    ev_str = ", ".join(rc.evidence) if rc.evidence else "No direct evidence cited"
+                    st.markdown(f"- **{rc.category}** ({rc.severity}): **{rc.cause}** — {rc.description} *(Evidence: {ev_str})*")
+            elif rca.summary:
+                st.markdown(f"**Summary:** {rca.summary}")
+        with t_sent:
+            st.markdown(f"**Overall Sentiment:** `{sentiment.overall_sentiment.value}` (Confidence: {sentiment.confidence_score}%)")
+            st.markdown(f"**Concern Areas:** {', '.join(sentiment.concern_areas) if sentiment.concern_areas else 'None detected'}")
+            st.markdown(f"**Summary:** {sentiment.summary}")
+            if sentiment.supporting_evidence:
+                with st.expander("Supporting Evidence"):
+                    for ev in sentiment.supporting_evidence:
+                        st.markdown(f"- {ev}")
+        with t_recs:
+            if recs.all_recommendations:
+                for act in recs.all_recommendations:
+                    prio_icon = "🔴" if act.priority == "Critical" else ("🟡" if act.priority == "High" else "🟢")
+                    st.markdown(f"#### {prio_icon} [{act.priority.upper()}] {act.category}: {act.action}")
+                    if act.rationale:
+                        st.markdown(f"**Rationale:** {act.rationale}")
+                    st.markdown(f"*Timeframe: {act.timeframe} | Impact: {act.expected_impact}*")
+                    st.divider()
+            else:
+                st.info("No recommendations generated.")
+    else:
+        st.markdown(
+            '<div class="section-card"><p>AI-generated health assessment, reasoning, '
+            "and risk analysis will be displayed here.</p></div>",
+            unsafe_allow_html=True,
+        )
+
+
+# =============================================================================
+# Page: Portfolio View
+# Multi-project portfolio analysis placeholder.
+# =============================================================================
+def render_portfolio_page():
+    """Render the portfolio analysis page."""
+    st.subheader("📈 Portfolio Overview")
+    if "portfolio_analytics" in st.session_state and st.session_state["portfolio_analytics"]:
+        pa: PortfolioAnalyticsResult = st.session_state["portfolio_analytics"]
+        dist = pa.portfolio_health_distribution
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Projects", dist.total_projects)
+        c2.metric("🟢 Green", f"{dist.green_count} ({dist.green_percent}%)")
+        c3.metric("🟡 Amber", f"{dist.amber_count} ({dist.amber_percent}%)")
+        c4.metric("🔴 Red", f"{dist.red_count} ({dist.red_percent}%)")
+
+        st.markdown(f"**Portfolio Summary:** {pa.portfolio_summary}")
+        if pa.executive_summary:
+            st.info(f"**Executive Briefing:** {pa.executive_summary}")
+
+        t_attn, t_trends, t_risks, t_blockers = st.tabs(["🚨 Executive Attention List", "📈 Trends & Trajectories", "⚠️ Top Risks", "🛑 Active Blockers"])
+        with t_attn:
+            if pa.executive_attention_list:
+                for item in pa.executive_attention_list:
+                    st.markdown(f"### `[{item.priority.upper()}]` {item.project_name} ({item.current_rag})")
+                    st.markdown(f"**Reason:** {item.reason_for_escalation}")
+                    st.markdown(f"**Impact:** {item.business_impact}")
+                    st.divider()
+            else:
+                st.success("No projects currently require executive escalation.")
+        with t_trends:
+            if pa.trend_analysis:
+                for t in pa.trend_analysis:
+                    st.markdown(f"- **[{t.category}] {t.trend_name}** (Impacts {t.affected_project_count} projects): {t.description}")
+            else:
+                st.info("No cross-project trends detected.")
+        with t_risks:
+            if pa.risk_analysis:
+                for r in pa.risk_analysis:
+                    st.markdown(f"- **[{r.severity}] {r.risk_title}** ({r.frequency} occurrences across: {', '.join(r.affected_projects)})")
+            else:
+                st.info("No major portfolio risks aggregated.")
+        with t_blockers:
+            if pa.blocker_analysis:
+                for b in pa.blocker_analysis:
+                    st.markdown(f"- **{b.blocker_title}** ({b.category}, {b.frequency} occurrences): {b.business_impact}")
+            else:
+                st.info("No active blockers detected across portfolio.")
+    else:
+        st.info(
+            "When multiple projects are analyzed, this page will display "
+            "portfolio-wide health distribution, trends, recurring risks, "
+            "and projects requiring executive attention.",
+            icon="ℹ️",
+        )
+        st.markdown(
+            '<div class="section-card"><p>Portfolio analytics will be generated '
+            "after project plans have been analyzed.</p></div>",
+            unsafe_allow_html=True,
+        )
+
+
+# =============================================================================
+# Page: Reports
+# Weekly reports and presentation download page.
+# =============================================================================
+def render_reports_page():
+    """Render the reports and presentations page."""
+    st.subheader("📄 Generated Reports")
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown(
+            """
+            <div class="section-card">
+                <h3>📝 Weekly Health Report</h3>
+                <p>
+                    A structured project health report including RAG status,
+                    health indicators, AI reasoning, risks, and recommendations.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if "analyzed_projects" in st.session_state and st.session_state["analyzed_projects"]:
+            proj_names = list(st.session_state["analyzed_projects"].keys())
+            sel_report_proj = st.selectbox("Select Project for Report", options=proj_names, key="sel_rep_proj")
+            report_md = st.session_state["analyzed_projects"][sel_report_proj].get("weekly_report_md", "")
+            if report_md:
+                st.download_button(
+                    label="📥 Download Weekly Report (.md)",
+                    data=report_md,
+                    file_name=f"{sel_report_proj}_Weekly_Report.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                    type="primary"
+                )
+                with st.expander("Preview Weekly Report", expanded=True):
+                    st.markdown(report_md)
+            else:
+                st.button("📥 Download Weekly Report", disabled=True, use_container_width=True)
+        else:
+            st.button("📥 Download Weekly Report", disabled=True, use_container_width=True)
+
+    with right:
+        st.markdown(
+            """
+            <div class="section-card">
+                <h3>📊 Executive Presentation</h3>
+                <p>
+                    An auto-generated 5–7 slide PowerPoint deck summarizing
+                    portfolio health, emerging risks, trends, and strategic
+                    recommendations for leadership.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if "pptx_presentation" in st.session_state and st.session_state["pptx_presentation"] and st.session_state["pptx_presentation"].success:
+            pptx_obj = st.session_state["pptx_presentation"]
+            try:
+                with open(pptx_obj.file_path, "rb") as f:
+                    pptx_bytes = f.read()
+                st.download_button(
+                    label="📥 Download Executive PPT (.pptx)",
+                    data=pptx_bytes,
+                    file_name=Path(pptx_obj.file_path).name,
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True,
+                    type="primary"
+                )
+                with st.expander("Slide Deck Summary & Structure", expanded=True):
+                    st.markdown(f"**Summary:** {pptx_obj.presentation_summary}")
+                    for sm in pptx_obj.slides_metadata:
+                        st.markdown(f"- **Slide {sm.slide_number}:** {sm.title} *(Type: {sm.slide_type})*")
+            except Exception as e:
+                st.error(f"Error reading presentation file: {e}")
+        else:
+            st.button("📥 Download Executive PPT", disabled=True, use_container_width=True)
+
+
+# =============================================================================
+# Main Application Entry Point
+# =============================================================================
+def main():
+    """Application entry point — applies styles and routes to the active page."""
+    # Apply custom CSS
+    apply_custom_styles()
+
+    # Render sidebar and capture selected page
+    selected_page = render_sidebar()
+
+    # Render header
+    render_header()
+
+    # Route to the selected page
+    if selected_page == "🏠  Dashboard":
+        render_dashboard()
+    elif selected_page == "📁  Upload & Analyze":
+        render_upload_page()
+    elif selected_page == "📈  Portfolio View":
+        render_portfolio_page()
+    elif selected_page == "📄  Reports":
+        render_reports_page()
+
+
+# Run the application
+if __name__ == "__main__":
+    main()

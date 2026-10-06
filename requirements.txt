@@ -1,0 +1,21 @@
+# =============================================================================
+# Project Health Reporting Agent — Dependencies
+# Python >= 3.10 recommended
+# =============================================================================
+
+# --- Web Framework ---
+streamlit>=1.45.0            # Interactive UI for file upload, dashboards, reports
+
+# --- Data Processing ---
+pandas>=2.2.0                # Tabular data manipulation for project plan analysis
+openpyxl>=3.1.0              # Read/write Microsoft Excel (.xlsx) files
+
+# --- Environment & Configuration ---
+python-dotenv>=1.1.0         # Load environment variables from .env file
+
+# --- AI / LLM ---
+openai>=1.82.0               # OpenAI API client for GPT-based reasoning & analysis
+
+# --- Presentation Generation & UI ---
+python-pptx>=1.0.0           # Generate PowerPoint (.pptx) executive presentations
+plotly>=5.18.0               # High-end interactive enterprise charts
